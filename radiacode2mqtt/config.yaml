@@ -1,0 +1,88 @@
+name: radiacode2mqtt
+version: "0.1.0"
+slug: radiacode2mqtt
+description: Publish Radiacode readings to MQTT
+arch:
+  - amd64
+  - aarch64
+  - armv7
+
+startup: services
+boot: auto
+
+# Use Supervisor-supported USB access (works with Protection mode)
+usb: true
+
+# Optional but generally harmless; can be removed later if usb:true alone works
+devices:
+  - /dev/bus/usb
+
+# Keep these to preserve BLE operation potential
+host_network: true
+host_dbus: true
+
+privileged:
+  - NET_ADMIN
+  - NET_RAW
+
+options:
+  radiacode_mac: ""
+  ble_connect_timeout_s: 20
+  ble_scan_enabled: true
+  ble_scan_seconds: 5
+  poll_interval_s: 5
+  first_data_timeout_s: 60
+
+  # Logging / health
+  debug: false
+  watchdog_s: 30
+  status_publish_every_s: 30
+
+  dose:
+    system: Sv
+    prefix: micro
+
+  spectrum:
+    enabled: true
+    interval_s: 120
+    retain: false
+
+  mqtt:
+    host: core-mosquitto
+    port: 1883
+    username: ""
+    password: ""
+    topic_prefix: radiacode
+    discovery_prefix: homeassistant
+    discovery: true
+
+schema:
+  radiacode_mac: str?
+  ble_connect_timeout_s: int(5,120)?
+  ble_scan_enabled: bool?
+  ble_scan_seconds: int(1,30)?
+  poll_interval_s: int(1,3600)
+  first_data_timeout_s: int(1,600)?
+
+  # Logging / health
+  debug: bool?
+  watchdog_s: int(5,600)?
+  status_publish_every_s: int(5,600)?
+
+  dose:
+    system: list(Sv|R)
+    prefix: list(whole|deci|centi|milli|micro|nano)
+
+  spectrum:
+    enabled: bool
+    interval_s: int(5,86400)
+    retain: bool
+
+  mqtt:
+    host: str
+    port: int(1,65535)
+    username: str?
+    password: password?
+    topic_prefix: str
+    discovery_prefix: str
+    discovery: bool
