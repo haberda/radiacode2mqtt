@@ -106,14 +106,18 @@ def get_system_and_prefix(opts: dict[str, Any]) -> tuple[str, str]:
 
 def get_rate_unit_and_factor(opts: dict[str, Any]) -> Tuple[str, float]:
     system, prefix = get_system_and_prefix(opts)
-    factor = float(PREFIX_FACTOR[prefix])
+    # Buffered protocol values are R (dose) and R/h (rate).
+    # Match the device convention: 100 R = 1 Sv; see UNIT_NOTES.md.
+    factor = float(PREFIX_FACTOR[prefix]) * (0.01 if system == "Sv" else 1.0)
     unit = f"{PREFIX_SYMBOL[prefix]}{system}/h"
     return unit, factor
 
 
 def get_dose_unit_and_factor(opts: dict[str, Any]) -> Tuple[str, float]:
     system, prefix = get_system_and_prefix(opts)
-    factor = float(PREFIX_FACTOR[prefix])
+    # Buffered protocol values are R (dose) and R/h (rate).
+    # Match the device convention: 100 R = 1 Sv; see UNIT_NOTES.md.
+    factor = float(PREFIX_FACTOR[prefix]) * (0.01 if system == "Sv" else 1.0)
     unit = f"{PREFIX_SYMBOL[prefix]}{system}"
     return unit, factor
 
