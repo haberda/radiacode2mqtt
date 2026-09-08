@@ -1,37 +1,15 @@
-#!/usr/bin/env python3
-"""
-radiacode2mqtt.py (publisher-only) with robust BLE recovery (NO addrType patch).
-
-Why this version:
-- MQTT connects first so status is always visible even if BLE connect hangs.
-- Optional BLE scan preflight to avoid connect attempts when device isn't advertising.
-- Hard connect timeout so bluepy/radiacode connect cannot stall forever.
-- Recovery:
-  1) Detect stale realtime stream (no RealTimeData for watchdog_s)
-  2) Close/disconnect best-effort
-  3) Kill bluepy-helper processes (best-effort)
-  4) Reconnect with exponential backoff
-  5) If recovery fails repeatedly, exit(1) so HA restarts the add-on
-
-Topics (base = <topic_prefix>/<device_id>):
-- <base>/state            (NOT retained)
-- <base>/availability     ("online"/"offline"; retained)
-- <base>/status           (JSON status/errors; NOT retained)
-- <base>/heartbeat        (ts only; NOT retained)
-- <base>/raw_fields       (debug snapshot; retained; only when debug enabled)
-- <base>/spectrum         (optional; retain configurable)
-"""
-
 from __future__ import annotations
 
 import json
 import logging
 import signal
-import subprocess
+import asyncio
+import multiprocessing
+import re
+import threading
 import sys
 import time
-import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import paho.mqtt.client as mqtt
@@ -164,38 +142,80 @@ def setup_logging(debug: bool) -> logging.Logger:
 # MQTT helpers
 # ---------------------------
 
-def mqtt_make_client(cfg: MqttConfig, client_id: str) -> mqtt.Client:
-    client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    if cfg.username and cfg.password:
-        client.username_pw_set(cfg.username, cfg.password)
-    return client
+class MqttBridge:
+    """Paho owns network I/O; the application owns device health."""
 
+    def __init__(self, cfg, opts, device_id, log):
+        self.cfg, self.opts, self.device_id, self.log = cfg, opts, device_id, log
+        self.base = f"{cfg.topic_prefix}/{device_id}"
+        self.connected = threading.Event()
+        self.refresh = threading.Event()
+        self.client = mqtt.Client(client_id=f"radiacode2mqtt-{device_id}",
+                                  callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        if cfg.username:
+            self.client.username_pw_set(cfg.username, cfg.password)
+        self.client.will_set(f"{self.base}/availability", "offline", qos=1, retain=True)
+        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        self.client.max_queued_messages_set(32)
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_message = self.on_message
+        self.client.enable_logger(log)
 
-def mqtt_connect_and_loop(client: mqtt.Client, cfg: MqttConfig, log: logging.Logger, will_topic: str) -> dict[str, Any]:
-    mqtt_state: dict[str, Any] = {"connected": False, "last_connect_ts": None, "last_disconnect_ts": None}
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code.is_failure:
+            self.connected.clear()
+            self.log.error("MQTT connection rejected: %s", reason_code)
+            return
+        self.connected.set()
+        self.refresh.set()
+        client.subscribe(f"{self.cfg.discovery_prefix}/status", qos=1)
+        self.log.info("MQTT connected")
 
-    client.will_set(will_topic, payload="offline", qos=0, retain=True)
+    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.connected.clear()
+        self.log.info("MQTT disconnected: %s", reason_code)
 
-    def on_connect(_client, _userdata, _flags, reason_code, _props=None):
-        mqtt_state["connected"] = True
-        mqtt_state["last_connect_ts"] = int(time.time())
-        log.info("MQTT connected to %s:%s (reason_code=%s)", cfg.host, cfg.port, reason_code)
+    def on_message(self, client, userdata, message):
+        if message.topic == f"{self.cfg.discovery_prefix}/status" and message.payload == b"online":
+            self.refresh.set()
 
-    def on_disconnect(_client, _userdata, reason_code, _props=None):
-        mqtt_state["connected"] = False
-        mqtt_state["last_disconnect_ts"] = int(time.time())
-        if reason_code == 0:
-            log.info("MQTT disconnected cleanly")
-        else:
-            log.warning("MQTT disconnected (reason_code=%s)", reason_code)
+    def start(self):
+        self.client.connect_async(self.cfg.host, self.cfg.port, keepalive=30)
+        self.client.loop_start()
 
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
+    def publish(self, suffix, payload, *, retain=False, qos=0):
+        if not self.connected.is_set():
+            return None  # Do not replay stale measurements after a broker outage.
+        if not isinstance(payload, str):
+            payload = json_dumps(payload)
+        info = self.client.publish(f"{self.base}/{suffix}", payload, qos=qos, retain=retain)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            self.log.warning("MQTT publish failed for %s: %s", suffix, info.rc)
+        return info
 
-    log.info("Connecting to MQTT broker %s:%s", cfg.host, cfg.port)
-    client.connect(cfg.host, cfg.port, keepalive=60)
-    client.loop_start()
-    return mqtt_state
+    def sync(self, healthy):
+        if self.connected.is_set() and self.refresh.is_set():
+            self.refresh.clear()
+            if self.cfg.discovery:
+                publish_discovery(self.client, self.cfg, self.opts, self.device_id, self.log)
+            self.publish("availability", "online", retain=True, qos=1)
+            self.health(healthy)
+
+    def health(self, healthy):
+        self.publish("device_availability", "online" if healthy else "offline", retain=True, qos=1)
+
+    def close(self):
+        try:
+            self.health(False)
+            info = self.publish("availability", "offline", retain=True, qos=1)
+            if info is not None:
+                info.wait_for_publish(timeout=2)
+        except (RuntimeError, ValueError) as error:
+            self.log.debug("Offline delivery failed: %s", error)
+        finally:
+            self.client.disconnect()
+            self.client.loop_stop()
 
 
 # ---------------------------
@@ -228,16 +248,26 @@ def publish_discovery(client: mqtt.Client, cfg: MqttConfig, opts: dict[str, Any]
             "unique_id": f"{device_id}_{object_id}",
             "state_topic": state_topic,
             "value_template": value_template,
-            "availability_topic": avail_topic,
+            "availability": [{"topic": avail_topic}],
+            "availability_mode": "all",
             "device": device_block,
         }
+        diagnostics = {"flags", "real_time_flags", "last_seen_age_s", "device_status", "mqtt_connected", "count_rate_err", "dose_rate_err"}
+        if object_id in diagnostics:
+            payload["entity_category"] = "diagnostic"
+        else:
+            payload["availability"].append({"topic": f"{base}/device_availability"})
+        if unit is not None and object_id not in {"dose_total", "spectrum_duration_s", "last_seen_age_s"}:
+            payload["state_class"] = "measurement"
+        if object_id not in diagnostics:
+            payload["expire_after"] = int(opts.get("watchdog_s", 30)) + int(opts.get("poll_interval_s", 5))
         if unit is not None:
             payload["unit_of_measurement"] = unit
         if device_class is not None:
             payload["device_class"] = device_class
 
         topic = f"{cfg.discovery_prefix}/sensor/{device_id}/{object_id}/config"
-        client.publish(topic, json_dumps(payload), retain=True)
+        client.publish(topic, json_dumps(payload), qos=1, retain=True)
 
     pub_sensor("dose_rate", "Radiacode Dose Rate", "{{ value_json.dose_rate }}", rate_unit)
     pub_sensor("cps", "Radiacode CPS", "{{ value_json.cps }}", "cps")
@@ -262,480 +292,293 @@ def publish_discovery(client: mqtt.Client, cfg: MqttConfig, opts: dict[str, Any]
 # Radiacode helpers
 # ---------------------------
 
-def safe_close_device(dev: Any, log: logging.Logger) -> None:
-    for name in ("close", "disconnect", "stop"):
-        fn = getattr(dev, name, None)
-        if callable(fn):
-            try:
-                fn()
-                log.debug("Called device.%s()", name)
-            except Exception as e:
-                log.debug("device.%s() failed: %s", name, e)
-
-
-def kill_bluepy_helper(log: logging.Logger) -> None:
-    """Best-effort kill of bluepy-helper processes in the container."""
-    try:
-        res = subprocess.run(["pkill", "-f", "bluepy-helper"], capture_output=True, text=True)
-        if res.returncode == 0:
-            log.warning("Killed bluepy-helper via pkill -f bluepy-helper")
-    except Exception:
-        pass
-
-    try:
-        res = subprocess.run(["killall", "bluepy-helper"], capture_output=True, text=True)
-        if res.returncode == 0:
-            log.warning("Killed bluepy-helper via killall bluepy-helper")
-    except Exception:
-        pass
-
-
-class _ConnectTimeout(Exception):
-    pass
-
-
-def _alarm_handler(_signum, _frame):
-    raise _ConnectTimeout("connect timeout")
-
-
-def compute_device_id_from_opts(opts: dict[str, Any]) -> tuple[str, str]:
+def compute_device_id_from_opts(opts):
     mac = (opts.get("radiacode_mac") or "").strip()
-    if mac:
-        return mac.lower().replace(":", ""), "ble"
-    return "radiacode_usb", "usb"
+    device_id = (opts.get("device_id") or "").strip()
+    if device_id and not re.fullmatch(r"[A-Za-z0-9_-]+", device_id):
+        raise ValueError("device_id must contain only letters, digits, underscores or hyphens")
+    # Empty preserves existing Home Assistant unique IDs. Set device_id to a
+    # serial-based name when adding another instance; see DOCS.md.
+    return device_id or (mac.lower().replace(":", "") if mac else "radiacode_usb"), "ble" if mac else "usb"
 
 
-def ble_scan_for_mac(target_mac: str, scan_s: float, log: logging.Logger) -> bool:
-    """Return True if target_mac is seen during scan window."""
-    try:
-        from bluepy.btle import Scanner  # type: ignore
-        target = target_mac.strip().lower()
-        log.debug("BLE scan preflight: scanning %.1fs for %s", scan_s, target)
-        devs = Scanner().scan(scan_s)
-        for d in devs:
-            if d.addr.lower() == target:
-                log.info("BLE scan preflight: saw target %s (rssi=%s)", d.addr, d.rssi)
-                return True
-        log.warning("BLE scan preflight: did NOT see target %s", target)
-        return False
-    except Exception as e:
-        log.warning("BLE scan preflight failed: %s", e, exc_info=True)
-        return False
-
-
-def make_device(opts: dict[str, Any], log: logging.Logger) -> tuple[RadiaCode, str, str]:
-    mac = (opts.get("radiacode_mac") or "").strip()
-
-    if mac:
-        timeout_s = get_ble_connect_timeout(opts)
-        log.info("Connecting to Radiacode via BLE (mac=%s timeout=%ss)", mac, timeout_s)
-
-        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(timeout_s)
-        try:
-            dev = RadiaCode(bluetooth_mac=mac)
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-
-        return dev, mac.lower().replace(":", ""), "ble"
-
-    log.info("Connecting to Radiacode via USB (auto-detect)")
-    dev = RadiaCode()
-    return dev, "radiacode_usb", "usb"
-
-
-def pick_first(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-
-def get_latest_records(device: RadiaCode) -> tuple[Optional[RealTimeData], Optional[RareData], dict[str, int]]:
-    buf = device.data_buf()
-    rt: Optional[RealTimeData] = None
-    rare: Optional[RareData] = None
-    types: dict[str, int] = {}
-    for rec in buf:
-        t = type(rec).__name__
-        types[t] = types.get(t, 0) + 1
-        if isinstance(rec, RealTimeData):
-            rt = rec
-        elif isinstance(rec, RareData):
-            rare = rec
-    return rt, rare, types
-
-
-# ---------------------------
-# Main loop with HARD BLE recovery
-# ---------------------------
-
-def main() -> None:
-    opts = load_options()
-    debug = bool(opts.get("debug", False))
-    log = setup_logging(debug)
+def validate_options(opts):
+    poll = float(opts.get("poll_interval_s", 5))
+    watchdog = float(opts.get("watchdog_s", 30))
+    if poll <= 0 or watchdog <= poll:
+        raise ValueError("watchdog_s must be greater than poll_interval_s > 0")
+    for key, default in (("first_data_timeout_s", 60), ("ble_connect_timeout_s", 20),
+                         ("operation_timeout_s", 30), ("status_publish_every_s", 30),
+                         ("max_recoveries", 8)):
+        if float(opts.get(key, default)) <= 0:
+            raise ValueError(f"{key} must be positive")
+    compute_device_id_from_opts(opts)
     cfg = parse_mqtt_cfg(opts)
+    if not cfg.host or not 1 <= cfg.port <= 65535:
+        raise ValueError("Invalid MQTT host or port")
+    for prefix in (cfg.topic_prefix, cfg.discovery_prefix):
+        if not prefix or any(char in prefix for char in ("#", "+", "\x00")):
+            raise ValueError("MQTT prefixes must be nonempty and contain no wildcards")
 
-    poll_s = int(opts.get("poll_interval_s", 5))
-    first_data_timeout_s = float(opts.get("first_data_timeout_s", 60))
-    watchdog_s = float(opts.get("watchdog_s", 30))
-    status_publish_every_s = float(opts.get("status_publish_every_s", 30))
 
-    spectrum_cfg = (opts.get("spectrum") or {})
-    spectrum_enabled = bool(spectrum_cfg.get("enabled", False))
-    spectrum_interval_s = int(spectrum_cfg.get("interval_s", 120))
-    spectrum_retain = bool(spectrum_cfg.get("retain", False))
-
-    # BLE recovery tuning
-    ble_max_recoveries_before_exit = int(opts.get("ble_max_recoveries_before_exit", 8))
-    ble_backoff_s = float(opts.get("ble_backoff_s", 2.0))
-    ble_backoff_max_s = float(opts.get("ble_backoff_max_s", 60.0))
-
-    ble_scan_enabled = get_ble_scan_enabled(opts)
-    ble_scan_s = get_ble_scan_seconds(opts)
-    ble_connect_timeout_s = get_ble_connect_timeout(opts)
-
-    system, prefix = get_system_and_prefix(opts)
-    rate_unit, _ = get_rate_unit_and_factor(opts)
-    dose_unit, _ = get_dose_unit_and_factor(opts)
-
-    log.info("Starting radiacode2mqtt (publisher-only)")
-    log.info("Config: poll_interval_s=%s first_data_timeout_s=%s watchdog_s=%s debug=%s", poll_s, first_data_timeout_s, watchdog_s, debug)
-    log.info("Dose config: system=%s prefix=%s (rate_unit=%s dose_unit=%s)", system, prefix, rate_unit, dose_unit)
-    log.info("Spectrum: enabled=%s interval_s=%s retain=%s", spectrum_enabled, spectrum_interval_s, spectrum_retain)
-    log.info("MQTT: host=%s port=%s topic_prefix=%s discovery_prefix=%s discovery=%s",
-             cfg.host, cfg.port, cfg.topic_prefix, cfg.discovery_prefix, cfg.discovery)
-    log.info("BLE: scan_enabled=%s scan_seconds=%s connect_timeout_s=%s",
-             ble_scan_enabled, ble_scan_s, ble_connect_timeout_s)
-    log.info("BLE recovery: max_recoveries_before_exit=%s backoff_s=%s backoff_max_s=%s",
-             ble_max_recoveries_before_exit, ble_backoff_s, ble_backoff_max_s)
-
-    # Compute device_id without connecting so MQTT is always available
-    device_id, mode_guess = compute_device_id_from_opts(opts)
-
-    base = f"{cfg.topic_prefix}/{device_id}"
-    state_topic = f"{base}/state"
-    status_topic = f"{base}/status"
-    avail_topic = f"{base}/availability"
-    heartbeat_topic = f"{base}/heartbeat"
-    raw_fields_topic = f"{base}/raw_fields"
-    spectrum_topic = f"{base}/spectrum"
-
-    # MQTT connect first
-    mqttc = mqtt_make_client(cfg, client_id=f"radiacode2mqtt-{device_id}")
-    mqtt_state = mqtt_connect_and_loop(mqttc, cfg, log, will_topic=avail_topic)
-
-    if cfg.discovery:
-        try:
-            publish_discovery(mqttc, cfg, opts, device_id, log)
-        except Exception as e:
-            log.error("Failed to publish MQTT discovery: %s", e, exc_info=True)
-
-    mqttc.publish(avail_topic, "online", retain=True)
-    mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "started", "mode_guess": mode_guess}), retain=False)
-
-    # Connect device with retry/backoff
-    device: Optional[RadiaCode] = None
-    device_mode: str = mode_guess
-
-    connect_attempt = 0
-    connect_backoff = ble_backoff_s
-
-    while device is None:
-        connect_attempt += 1
+def device_process(pipe, opts):
+    """Isolate native USB and BLE calls so *all* operations can be bounded."""
+    device = None
+    try:
         mac = (opts.get("radiacode_mac") or "").strip()
-
-        if mode_guess == "ble" and ble_scan_enabled and mac:
-            seen = ble_scan_for_mac(mac, ble_scan_s, log)
-            mqttc.publish(status_topic, json_dumps({
-                "ts": int(time.time()),
-                "status": "ble_scan",
-                "attempt": connect_attempt,
-                "target_mac": mac.lower(),
-                "seen": seen,
-            }), retain=False)
-            if not seen:
-                time.sleep(connect_backoff)
-                connect_backoff = min(ble_backoff_max_s, connect_backoff * 2.0)
-                continue
-
-        try:
-            mqttc.publish(status_topic, json_dumps({
-                "ts": int(time.time()),
-                "status": "connecting_device",
-                "attempt": connect_attempt,
-                "mode_guess": mode_guess,
-            }), retain=False)
-
-            device, _device_id2, device_mode = make_device(opts, log)
-            mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "device_connected", "mode": device_mode}), retain=False)
-            break
-
-        except _ConnectTimeout as e:
-            log.error("Device connect timed out: %s", e)
-            mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "device_connect_timeout", "error": str(e)}), retain=False)
-            kill_bluepy_helper(log)
-
-        except Exception as e:
-            log.error("Device connect failed: %s", e, exc_info=True)
-            mqttc.publish(status_topic, json_dumps({
-                "ts": int(time.time()),
-                "status": "device_connect_failed",
-                "error": str(e),
-                "traceback_tail": traceback.format_exc().splitlines()[-10:],
-            }), retain=False)
-            kill_bluepy_helper(log)
-
-        if mode_guess == "ble":
-            time.sleep(connect_backoff)
-            connect_backoff = min(ble_backoff_max_s, connect_backoff * 2.0)
-            if connect_attempt >= ble_max_recoveries_before_exit:
-                mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "exiting_for_restart", "attempts": connect_attempt}), retain=False)
-                time.sleep(1.0)
-                raise SystemExit(1)
-        else:
-            time.sleep(3)
-
-    assert device is not None
-
-    # Tracking
-    first_data_deadline = time.time() + first_data_timeout_s
-    last_seen_ts: Optional[float] = None
-    last_status_publish_ts: float = 0.0
-    logged_waiting = False
-    device_status = "waiting"
-    last_error: Optional[str] = None
-
-    cached_temperature_c: Optional[float] = None
-    cached_battery_pct: Optional[float] = None
-    cached_spectrum_duration_s: Optional[int] = None
-    cached_dose_total: Optional[float] = None
-    cached_rare_seen_ts: Optional[float] = None
-
-    next_spectrum_at = time.time() + 3.0
-
-    ble_recoveries = 0
-    ble_next_allowed_reconnect_ts: float = 0.0
-    current_backoff_s = ble_backoff_s
-
-    log.info("Publishing topics base=%s (device_mode=%s)", base, device_mode)
-
-    while True:
-        now = time.time()
-        mqttc.publish(heartbeat_topic, json_dumps({"ts": int(now)}), retain=False)
-
-        # BLE watchdog recovery
-        if device_mode == "ble" and last_seen_ts is not None and (now - last_seen_ts) >= watchdog_s:
-            stale_for = now - last_seen_ts
-
-            if now < ble_next_allowed_reconnect_ts:
-                time.sleep(min(poll_s, max(0.1, ble_next_allowed_reconnect_ts - now)))
-                continue
-
-            ble_recoveries += 1
-            log.warning("BLE stale for %.1fs -> recovery attempt %s/%s", stale_for, ble_recoveries, ble_max_recoveries_before_exit)
-            mqttc.publish(status_topic, json_dumps({
-                "ts": int(now),
-                "status": "ble_stale",
-                "stale_for_s": stale_for,
-                "recovery_attempt": ble_recoveries,
-                "backoff_s": current_backoff_s,
-            }), retain=False)
-
+        if mac and opts.get("ble_scan_enabled", True):
+            from bleak import BleakScanner
             try:
-                safe_close_device(device, log)
+                asyncio.run(BleakScanner.find_device_by_address(
+                    mac, timeout=float(opts.get("ble_scan_seconds", 5))))
+            except Exception:
+                pass  # Optional preflight is advisory; always attempt connection.
+        device = RadiaCode(bluetooth_mac=mac or None,
+                           serial_number=opts.get("radiacode_serial") or None)
+        pipe.send((True, device.serial_number()))
+        while True:
+            command = pipe.recv()
+            if command == "close":
+                break
+            try:
+                result = device.data_buf() if command == "records" else device.spectrum()
+                pipe.send((True, result))
+            except Exception as error:
+                pipe.send((False, f"{type(error).__name__}: {error}"))
+    except Exception as error:
+        try:
+            pipe.send((False, f"{type(error).__name__}: {error}"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        if device is not None:
+            try:
+                device.close()
             except Exception:
                 pass
+        pipe.close()
 
-            kill_bluepy_helper(log)
-            time.sleep(1.5)
 
-            try:
-                device, _did, device_mode = make_device(opts, log)
-                last_seen_ts = None
-                logged_waiting = False
-                device_status = "waiting"
-                last_error = None
+class DeviceWorker:
+    def __init__(self, opts, stop):
+        self.opts, self.stop = opts, stop
+        context = multiprocessing.get_context("spawn")
+        self.pipe, child = context.Pipe()
+        self.process = context.Process(target=device_process, args=(child, opts), daemon=True)
+        self.process.start()
+        child.close()
 
-                current_backoff_s = ble_backoff_s
-                ble_next_allowed_reconnect_ts = time.time() + 0.5
+    def receive(self, timeout):
+        deadline = time.monotonic() + timeout
+        while not self.stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Radiacode operation timed out")
+            if self.pipe.poll(min(0.2, remaining)):
+                ok, result = self.pipe.recv()
+                if not ok:
+                    raise ConnectionError(result)
+                return result
+        raise InterruptedError("Stopping")
 
-                log.warning("BLE recovery succeeded")
-                mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "ble_recovered", "attempt": ble_recoveries}), retain=False)
+    def connect(self):
+        scan = float(self.opts.get("ble_scan_seconds", 5)) if self.opts.get("ble_scan_enabled", True) else 0
+        return self.receive(float(self.opts.get("ble_connect_timeout_s", 20)) + scan)
 
-            except Exception as e:
-                last_error = str(e)
-                device_status = "error"
-                log.error("BLE recovery failed: %s", e, exc_info=True)
-                mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "ble_recovery_failed", "error": last_error}), retain=False)
+    def request(self, command):
+        self.pipe.send(command)
+        return self.receive(float(self.opts.get("operation_timeout_s", 30)))
 
-                current_backoff_s = min(ble_backoff_max_s, current_backoff_s * 2.0)
-                ble_next_allowed_reconnect_ts = time.time() + current_backoff_s
-
-                if ble_recoveries >= ble_max_recoveries_before_exit:
-                    mqttc.publish(status_topic, json_dumps({"ts": int(time.time()), "status": "exiting_for_restart", "recovery_attempts": ble_recoveries}), retain=False)
-                    time.sleep(1.0)
-                    raise SystemExit(1)
-
-            time.sleep(0.5)
-            continue
-
-        # Spectrum
-        if spectrum_enabled and now >= next_spectrum_at:
-            try:
-                spec = device.spectrum()
-                payload = {
-                    "ts": int(time.time()),
-                    "duration_s": getattr(spec, "duration", None).total_seconds() if getattr(spec, "duration", None) else None,
-                    "a0": getattr(spec, "a0", None),
-                    "a1": getattr(spec, "a1", None),
-                    "a2": getattr(spec, "a2", None),
-                    "counts": getattr(spec, "counts", None),
-                }
-                mqttc.publish(spectrum_topic, json_dumps(payload), qos=0, retain=spectrum_retain)
-            except Exception as e:
-                log.debug("Spectrum read failed (ignored): %s", e)
-            next_spectrum_at = now + max(5, spectrum_interval_s)
-
+    def close(self):
         try:
-            rt, rare, type_hist = get_latest_records(device)
+            if self.process.is_alive():
+                self.pipe.send("close")
+                self.process.join(timeout=2)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=2)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=2)
+        except (BrokenPipeError, EOFError, OSError):
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=2)
+        finally:
+            self.pipe.close()
 
-            if rt is None:
-                if last_seen_ts is None:
-                    device_status = "waiting" if now < first_data_deadline else "stale"
-                else:
-                    device_status = "stale" if (now - last_seen_ts) >= watchdog_s else "waiting"
 
-                if not logged_waiting:
-                    log.warning("No RealTimeData (status=%s) buf_types=%s", device_status, type_hist)
-                    logged_waiting = True
+@dataclass
+class Recovery:
+    first_timeout: float
+    watchdog: float
+    max_attempts: int = 8
+    connected_at: float = 0
+    last_seen: Optional[float] = None
+    healthy_since: Optional[float] = None
+    attempts: int = 0
 
-                if (now - last_status_publish_ts) >= status_publish_every_s:
-                    mqttc.publish(status_topic, json_dumps({
-                        "ts": int(now),
-                        "status": "waiting_for_realtime_data" if now < first_data_deadline else "realtime_data_timeout",
-                        "device_status": device_status,
-                        "buf_types": type_hist,
-                    }), retain=False)
-                    last_status_publish_ts = now
+    def connected(self, now):
+        self.connected_at = now
+        self.last_seen = None
+        self.healthy_since = None
 
-                last_seen_age_s = None if last_seen_ts is None else max(0.0, now - last_seen_ts)
-                mqttc.publish(state_topic, json_dumps({
-                    "ts": int(now),
-                    "device_status": device_status,
-                    "last_seen_ts": None if last_seen_ts is None else int(last_seen_ts),
-                    "last_seen_age_s": last_seen_age_s,
-                    "mqtt_connected": bool(mqtt_state.get("connected", False)),
-                    "device_mode": device_mode,
-                    "last_error": last_error,
-                    "temperature_c": cached_temperature_c,
-                    "battery_pct": cached_battery_pct,
-                    "spectrum_duration_s": cached_spectrum_duration_s,
-                    "dose_total": cached_dose_total,
-                    "rare_last_seen_age_s": None if cached_rare_seen_ts is None else max(0.0, now - cached_rare_seen_ts),
-                }), qos=0, retain=False)
+    def observe(self, now):
+        self.last_seen = now
+        if self.healthy_since is None:
+            self.healthy_since = now
+        if now - self.healthy_since >= self.watchdog:
+            self.attempts = 0
 
-                time.sleep(poll_s)
+    def expired(self, now):
+        return (now - self.connected_at >= self.first_timeout if self.last_seen is None
+                else now - self.last_seen >= self.watchdog)
+
+    def failed(self):
+        self.healthy_since = None
+        self.last_seen = None
+        self.attempts += 1
+        if self.attempts >= self.max_attempts:
+            raise RuntimeError("Device recovery attempts exhausted")
+        return min(60, 2 ** self.attempts)
+
+
+@dataclass
+class Measurements:
+    opts: dict
+    values: dict = field(default_factory=dict)
+    raw: dict = field(default_factory=dict)
+    rare_seen: Optional[float] = None
+
+    def update(self, records, now):
+        realtime = False
+        types = {}
+        for record in records:
+            name = type(record).__name__
+            types[name] = types.get(name, 0) + 1
+            if isinstance(record, RareData):
+                self.rare_seen = now
+                self.raw["dose"] = record.dose
+                self.values.update(temperature_c=record.temperature, battery_pct=record.charge_level,
+                                   dose_duration_s=record.duration,
+                                   dose_total=record.dose * get_dose_unit_and_factor(self.opts)[1])
+            elif isinstance(record, RealTimeData):
+                realtime = True
+                self.raw.update(dose_rate=record.dose_rate, count_rate=record.count_rate)
+                self.values.update(dose_rate=record.dose_rate * get_rate_unit_and_factor(self.opts)[1],
+                                   cps=record.count_rate, count_rate_err=record.count_rate_err,
+                                   dose_rate_err=record.dose_rate_err, flags=record.flags,
+                                   real_time_flags=record.real_time_flags,
+                                   measurement_time=record.dt.isoformat())
+        return realtime, types
+
+    def spectrum(self, spec, timestamp):
+        duration = spec.duration.total_seconds()
+        self.values["spectrum_duration_s"] = duration
+        return dict(ts=timestamp, duration_s=duration, a0=spec.a0, a1=spec.a1, a2=spec.a2,
+                    counts=spec.counts, channels=len(spec.counts))
+
+    def payload(self, now, timestamp, status, recovery, mode, error=None):
+        fields = {name: self.values.get(name) for name in (
+            "dose_rate", "cps", "count_rate_err", "dose_rate_err", "flags", "real_time_flags",
+            "temperature_c", "battery_pct", "spectrum_duration_s", "dose_duration_s", "dose_total")}
+        fields.update(ts=timestamp, device_status=status, device_mode=mode, last_error=error,
+                      last_seen_age_s=None if recovery.last_seen is None else max(0, now - recovery.last_seen),
+                      rare_last_seen_age_s=None if self.rare_seen is None else max(0, now - self.rare_seen),
+                      mqtt_connected=True, dose_rate_unit=get_rate_unit_and_factor(self.opts)[0],
+                      dose_total_unit=get_dose_unit_and_factor(self.opts)[0],
+                      measurement_time=self.values.get("measurement_time"),
+                      raw=dict(self.raw, dose_rate_unit="R/h", dose_unit="R"))
+        return fields
+
+
+def run(opts, stop, log, bridge=None, worker_factory=DeviceWorker):
+    validate_options(opts)
+    device_id, mode = compute_device_id_from_opts(opts)
+    bridge = bridge or MqttBridge(parse_mqtt_cfg(opts), opts, device_id, log)
+    recovery = Recovery(float(opts.get("first_data_timeout_s", 60)),
+                        float(opts.get("watchdog_s", 30)), int(opts.get("max_recoveries", 8)))
+    measurements = Measurements(opts)
+    poll = float(opts.get("poll_interval_s", 5))
+    spectrum = opts.get("spectrum") or {}
+    worker = None
+    next_poll = next_spectrum = next_status = next_connect = 0.0
+    status, error = "connecting", None
+    bridge.start()
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
+            healthy = status == "ok" and not recovery.expired(now)
+            bridge.sync(healthy)
+            if now >= next_status:
+                bridge.publish("heartbeat", {"ts": int(time.time())})
+                bridge.publish("status", {"ts": int(time.time()), "status": status, "error": error})
+                bridge.publish("state", measurements.payload(now, int(time.time()), status, recovery, mode, error))
+                log.info("Device status=%s mode=%s attempts=%s", status, mode, recovery.attempts)
+                next_status = now + float(opts.get("status_publish_every_s", 30))
+            if now < next_connect or (worker is not None and now < next_poll):
+                stop.wait(0.2)
                 continue
+            try:
+                if worker is None:
+                    status = "connecting"
+                    bridge.health(False)
+                    worker = worker_factory(opts, stop)
+                    serial = worker.connect()
+                    log.info("Connected to Radiacode %s via %s", serial, mode)
+                    recovery.connected(time.monotonic())
+                    measurements = Measurements(opts)
+                    status, error = "waiting", None
+                    next_spectrum = time.monotonic() + 3
+                records = worker.request("records")
+                now = time.monotonic()
+                seen, types = measurements.update(records, now)
+                if seen:
+                    recovery.observe(now)
+                    status, error = "ok", None
+                elif recovery.expired(now):
+                    raise TimeoutError("No fresh realtime data within the configured deadline")
+                bridge.health(status == "ok")
+                if spectrum.get("enabled", False) and now >= next_spectrum:
+                    try:
+                        spec = worker.request("spectrum")
+                        bridge.publish("spectrum", measurements.spectrum(spec, int(time.time())),
+                                       retain=bool(spectrum.get("retain", False)))
+                    except (TimeoutError, ConnectionError, EOFError, OSError):
+                        raise  # Transport faults require a new worker.
+                    next_spectrum = time.monotonic() + max(5, int(spectrum.get("interval_s", 120)))
+                now = time.monotonic()
+                bridge.publish("state", measurements.payload(now, int(time.time()), status, recovery, mode))
+                if opts.get("debug", False):
+                    bridge.publish("raw_fields", {"ts": int(time.time()), "buf_types": types,
+                                                   "raw": measurements.raw}, retain=False)
+                next_poll = now + poll
+            except InterruptedError:
+                break
+            except Exception as exc:
+                error, status = str(exc), "recovering"
+                log.warning("Device operation failed: %s", error)
+                bridge.health(False)
+                bridge.publish("status", {"ts": int(time.time()), "status": status, "error": error})
+                if worker is not None:
+                    worker.close()
+                    worker = None
+                next_connect = time.monotonic() + recovery.failed()
+    finally:
+        if worker is not None:
+            worker.close()
+        bridge.close()
 
-            # Realtime OK
-            last_seen_ts = now
-            if logged_waiting:
-                log.info("Realtime stream resumed")
-                logged_waiting = False
-            device_status = "ok"
-            last_error = None
 
-            if rare is not None:
-                try:
-                    cached_temperature_c = getattr(rare, "temperature", cached_temperature_c)
-                    cached_battery_pct = getattr(rare, "charge_level", cached_battery_pct)
-                    cached_spectrum_duration_s = getattr(rare, "duration", cached_spectrum_duration_s)
-                    raw_dose_total = getattr(rare, "dose", None)
-                    if raw_dose_total is not None:
-                        _, dose_factor = get_dose_unit_and_factor(opts)
-                        cached_dose_total = raw_dose_total * dose_factor
-                    cached_rare_seen_ts = now
-                except Exception as e:
-                    log.debug("RareData cache failed: %s", e)
-
-            cps = pick_first(getattr(rt, "cps", None), getattr(rt, "count_rate", None))
-            count_rate_err = getattr(rt, "count_rate_err", None)
-            raw_dose_rate = getattr(rt, "dose_rate", None)
-            dose_rate_err = getattr(rt, "dose_rate_err", None)
-            flags = getattr(rt, "flags", None)
-            real_time_flags = getattr(rt, "real_time_flags", None)
-
-            _, rate_factor = get_rate_unit_and_factor(opts)
-            dose_rate = (raw_dose_rate * rate_factor) if raw_dose_rate is not None else None
-
-            mqttc.publish(state_topic, json_dumps({
-                "ts": int(now),
-                "device_status": device_status,
-                "last_seen_ts": int(last_seen_ts),
-                "last_seen_age_s": 0.0,
-                "mqtt_connected": bool(mqtt_state.get("connected", False)),
-                "device_mode": device_mode,
-
-                "dose_rate": dose_rate,
-                "cps": cps,
-                "count_rate_err": count_rate_err,
-                "dose_rate_err": dose_rate_err,
-                "flags": flags,
-                "real_time_flags": real_time_flags,
-
-                "temperature_c": cached_temperature_c,
-                "battery_pct": cached_battery_pct,
-                "spectrum_duration_s": cached_spectrum_duration_s,
-                "dose_total": cached_dose_total,
-                "dose_total_unit": get_dose_unit_and_factor(opts)[0],
-                "rare_last_seen_age_s": None if cached_rare_seen_ts is None else max(0.0, now - cached_rare_seen_ts),
-
-                "raw": {"dose_rate": raw_dose_rate, "count_rate": cps},
-            }), qos=0, retain=False)
-
-            if debug:
-                mqttc.publish(raw_fields_topic, json_dumps({
-                    "ts": int(now),
-                    "buf_types": type_hist,
-                    "realtime_fields": {
-                        "count_rate": cps,
-                        "count_rate_err": count_rate_err,
-                        "dose_rate": raw_dose_rate,
-                        "dose_rate_err": dose_rate_err,
-                        "flags": flags,
-                        "real_time_flags": real_time_flags,
-                    },
-                    "rare_fields": None if rare is None else {
-                        "duration": getattr(rare, "duration", None),
-                        "dose": getattr(rare, "dose", None),
-                        "temperature": getattr(rare, "temperature", None),
-                        "charge_level": getattr(rare, "charge_level", None),
-                        "flags": getattr(rare, "flags", None),
-                    },
-                }), retain=True)
-
-            if (now - last_status_publish_ts) >= status_publish_every_s:
-                log.info("OK: mode=%s cps=%s dose_rate=%s %s", device_mode, cps, dose_rate, get_rate_unit_and_factor(opts)[0])
-                mqttc.publish(status_topic, "ok", retain=False)
-                last_status_publish_ts = now
-
-        except SystemExit:
-            raise
-        except Exception as e:
-            device_status = "error"
-            last_error = str(e)
-            log.error("Unhandled error in main loop: %s", e, exc_info=True)
-            mqttc.publish(status_topic, json_dumps({
-                "ts": int(time.time()),
-                "status": "error",
-                "error": str(e),
-                "traceback_tail": traceback.format_exc().splitlines()[-12:],
-            }), retain=False)
-            time.sleep(2)
-
-        time.sleep(poll_s)
+def main():
+    opts = load_options()
+    log = setup_logging(bool(opts.get("debug", False)))
+    stop = threading.Event()
+    def shutdown(signum, frame):
+        stop.set()
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    run(opts, stop, log)
 
 
 if __name__ == "__main__":
