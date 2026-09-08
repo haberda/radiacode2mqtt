@@ -104,24 +104,6 @@ def json_dumps(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
-def get_ble_connect_timeout(opts: dict[str, Any]) -> int:
-    try:
-        return int(opts.get("ble_connect_timeout_s", 20))
-    except Exception:
-        return 20
-
-
-def get_ble_scan_enabled(opts: dict[str, Any]) -> bool:
-    return bool(opts.get("ble_scan_enabled", True))
-
-
-def get_ble_scan_seconds(opts: dict[str, Any]) -> float:
-    try:
-        return float(opts.get("ble_scan_seconds", 5))
-    except Exception:
-        return 5.0
-
-
 # ---------------------------
 # Logging
 # ---------------------------
@@ -257,7 +239,9 @@ def publish_discovery(client: mqtt.Client, cfg: MqttConfig, opts: dict[str, Any]
             payload["entity_category"] = "diagnostic"
         else:
             payload["availability"].append({"topic": f"{base}/device_availability"})
-        if unit is not None and object_id not in {"dose_total", "spectrum_duration_s", "last_seen_age_s"}:
+        if object_id == "dose_total":
+            payload["state_class"] = "total_increasing"
+        if unit is not None and object_id not in {"dose_total", "dose_duration_s", "spectrum_duration_s", "last_seen_age_s"}:
             payload["state_class"] = "measurement"
         if object_id not in diagnostics:
             payload["expire_after"] = int(opts.get("watchdog_s", 30)) + int(opts.get("poll_interval_s", 5))
@@ -279,6 +263,7 @@ def publish_discovery(client: mqtt.Client, cfg: MqttConfig, opts: dict[str, Any]
     pub_sensor("temperature_c", "Radiacode Temperature", "{{ value_json.temperature_c }}", "°C", device_class="temperature")
     pub_sensor("battery_pct", "Radiacode Battery", "{{ value_json.battery_pct }}", "%", device_class="battery")
     pub_sensor("spectrum_duration_s", "Radiacode Spectrum Duration", "{{ value_json.spectrum_duration_s }}", "s", device_class="duration")
+    pub_sensor("dose_duration_s", "Radiacode Dose Duration", "{{ value_json.dose_duration_s }}", "s", device_class="duration")
     pub_sensor("dose_total", "Radiacode Total Dose", "{{ value_json.dose_total }}", dose_unit)
 
     pub_sensor("last_seen_age_s", "Radiacode Last Seen Age", "{{ value_json.last_seen_age_s }}", "s", device_class="duration")
@@ -382,7 +367,8 @@ class DeviceWorker:
         raise InterruptedError("Stopping")
 
     def connect(self):
-        scan = float(self.opts.get("ble_scan_seconds", 5)) if self.opts.get("ble_scan_enabled", True) else 0
+        scan = (float(self.opts.get("ble_scan_seconds", 5))
+                if self.opts.get("radiacode_mac") and self.opts.get("ble_scan_enabled", True) else 0)
         return self.receive(float(self.opts.get("ble_connect_timeout_s", 20)) + scan)
 
     def request(self, command):
@@ -392,17 +378,16 @@ class DeviceWorker:
     def close(self):
         try:
             if self.process.is_alive():
-                self.pipe.send("close")
-                self.process.join(timeout=2)
+                try:
+                    self.pipe.send("close")
+                    self.process.join(timeout=2)
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
             if self.process.is_alive():
                 self.process.terminate()
                 self.process.join(timeout=2)
             if self.process.is_alive():
                 self.process.kill()
-                self.process.join(timeout=2)
-        except (BrokenPipeError, EOFError, OSError):
-            if self.process.is_alive():
-                self.process.terminate()
                 self.process.join(timeout=2)
         finally:
             self.pipe.close()

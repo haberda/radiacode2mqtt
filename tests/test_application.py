@@ -25,8 +25,6 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(app.get_dose_unit_and_factor(opts)[1], factor * scale)
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
@@ -177,3 +175,53 @@ class LoopTests(unittest.TestCase):
                 app.run({'first_data_timeout_s': 1, 'max_recoveries': 2}, stop, logging.getLogger(), bridge, Mock(return_value=worker))
         self.assertEqual(worker.close.call_count, 2)
         bridge.close.assert_called_once()
+
+import time
+
+
+def stalled_device(pipe, opts):
+    time.sleep(60)
+
+
+class WorkerTests(unittest.TestCase):
+    def test_hung_native_operation_is_terminated(self):
+        with patch.object(app, 'device_process', stalled_device):
+            worker = app.DeviceWorker({}, threading.Event())
+        try:
+            with self.assertRaises(TimeoutError):
+                worker.receive(0.05)
+        finally:
+            worker.close()
+        self.assertFalse(worker.process.is_alive())
+
+    def test_stop_interrupts_wait(self):
+        stop = threading.Event()
+        with patch.object(app, 'device_process', stalled_device):
+            worker = app.DeviceWorker({}, stop)
+        try:
+            stop.set()
+            with self.assertRaises(InterruptedError):
+                worker.receive(30)
+        finally:
+            worker.close()
+        self.assertFalse(worker.process.is_alive())
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_measurement_and_diagnostic_availability(self):
+        import json
+        client = Mock()
+        cfg = app.MqttConfig('broker', 1883, None, None, 'radiacode', 'homeassistant', True)
+        app.publish_discovery(client, cfg, {}, 'device', logging.getLogger())
+        payloads = {call.args[0].split('/')[-2]: json.loads(call.args[1])
+                    for call in client.publish.call_args_list}
+        self.assertEqual(len(payloads['dose_rate']['availability']), 2)
+        self.assertEqual(len(payloads['device_status']['availability']), 1)
+        self.assertEqual(payloads['dose_rate']['state_class'], 'measurement')
+        self.assertEqual(payloads['dose_total']['state_class'], 'total_increasing')
+        self.assertEqual(payloads['flags']['entity_category'], 'diagnostic')
+        self.assertIn('dose_duration_s', payloads)
+
+
+if __name__ == '__main__':
+    unittest.main()

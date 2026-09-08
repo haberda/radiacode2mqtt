@@ -1,96 +1,28 @@
-# radiacode2mqtt (Home Assistant Add-on)
+# radiacode2mqtt
 
-Publish Radiacode readings (USB or Bluetooth LE) to an MQTT broker and optionally create Home Assistant sensors via MQTT Discovery.
+Home Assistant add-on publishing Radiacode USB or Bluetooth LE measurements to
+MQTT, with automatic sensor discovery, spectrum data, and connection recovery.
+Supports amd64 and aarch64.
 
-This add-on is intended as a lightweight “publisher-only” bridge:
-- Radiacode (USB or BLE) → `radiacode/<device_id>/state` payloads
-- Optional Spectrum payload → `radiacode/<device_id>/spectrum`
-- Optional Home Assistant MQTT Discovery sensors
+## Installation
 
-**Note the bluetooth interface in the upstream radiacode python package is not very reliable. I suggest USB connection.**
+1. Open Home Assistant **Settings → Apps → App store** (or **Add-ons → Add-on store**).
+2. Open the menu → **Repositories**, and add `https://github.com/haberda/radiacode2mqtt`.
+3. Install **radiacode2mqtt**, configure your MQTT broker, and start it.
 
-## Features
+Leave `radiacode_mac` empty for USB, or set it for Bluetooth. New installations
+should set `device_id` to a stable serial-based identifier. Existing installations
+can leave it empty to preserve their Home Assistant entity IDs.
 
-- **USB and BLE support** (single device at a time)
-- **MQTT Discovery** (Home Assistant auto-creates sensors)
-- **Dose configuration**:
-  - System: `Sv` or `R`
-  - Prefix: `whole`, `deci`, `centi`, `milli`, `micro`, `nano`
-- **Realtime metrics**:
-  - count rate (CPS)
-  - dose rate
-  - associated percent errors (if provided by device)
-  - flags
-- **Device metrics (when available)**:
-  - temperature (°C)
-  - battery (%)
-  - total dose (integrated)
-  - spectrum accumulation duration (s)
-- **Optional spectrum publishing** (1024 channels) with configurable interval and retain
-- **Health/status topics** for diagnosing connection issues
+## Version 0.2.0 upgrade
 
-## Quick start
+Dose output in Sv is corrected to 1/100 of the previous value. Review existing
+thresholds and history. Bluetooth now uses Bleak throughout; USB and BLE share
+bounded recovery. Compilers, bluepy, and the unused web interface are removed.
 
-1. In Home Assistant, open **Settings → Apps → App store** (called **Add-ons → Add-on store** in older versions), open the menu → **Repositories**, and add `https://github.com/haberda/radiacode2mqtt`. Then install **radiacode2mqtt**.
-2. Configure MQTT broker settings.
-3. Choose connection method:
-   - **USB**: leave `radiacode_mac` empty, plug device into the HA host
-   - **BLE**: set `radiacode_mac` to the device MAC address
-
-4. Start the add-on.
-5. If MQTT Discovery is enabled, new sensors should appear in Home Assistant automatically.
-
-The add-on supports **amd64** and **aarch64**. Home Assistant builds the image locally when installing it.
-
-The image uses Python 3.11 slim Bookworm with build tools isolated in a separate build stage. The existing BLE preflight scan still requires bluepy, even when the installed Radiacode library uses Bleak; this release does not migrate that application code.
-
-## Configuration (high level)
-
-- `radiacode_mac`: BLE MAC address (empty = USB)
-- `poll_interval_s`: realtime polling interval
-- `dose.system`: `Sv` or `R`
-- `dose.prefix`: `whole|deci|centi|milli|micro|nano`
-- `spectrum.enabled`: publish spectrum payloads
-- `mqtt.*`: broker connection and topic settings
-
-See [DOCS.md](DOCS.md) for the complete schema and examples.
-
-## MQTT topics
-
-Assuming:
-- `mqtt.topic_prefix = radiacode`
-- `device_id` is `radiacode_usb` for USB, or the BLE MAC without colons for BLE.
-
-Then the add-on publishes:
-
-- `radiacode/<device_id>/availability` (retained): `online` / `offline`
-- `radiacode/<device_id>/state` (not retained): current readings (JSON)
-- `radiacode/<device_id>/status` (not retained): status / errors (JSON or simple string)
-- `radiacode/<device_id>/heartbeat` (not retained): `{ "ts": <unix> }`
-- `radiacode/<device_id>/spectrum` (optional; retain configurable): latest spectrum payload
-- `radiacode/<device_id>/raw_fields` (debug only; retained): raw buffer snapshot
-
-## Important BLE notes
-
-BLE access in Home Assistant OS is sensitive to container permissions and host Bluetooth state.
-
-If you see errors like:
-- `Permission Denied` from bluepy management commands
-- connect attempts that never succeed / time out
-- device not found while it is clearly advertising
-
-Then review the “BLE permissions” and “Troubleshooting” sections in [DOCS.md](DOCS.md).
-
-## Support / troubleshooting
-
-Please include:
-- Add-on logs (from start through failure)
-- Your add-on configuration (redact passwords)
-- MQTT broker logs (if relevant)
-- Whether the Radiacode is connected to a phone at the same time (often prevents BLE connection)
-
-See [DOCS.md](DOCS.md) for a checklist and common fixes.
+See [configuration, migration, and troubleshooting](DOCS.md) and the linked unit
+research notes for conversion evidence and hardware verification limits.
 
 ## License
 
-MIT (or your preferred license)
+MIT.

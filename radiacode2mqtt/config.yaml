@@ -1,5 +1,5 @@
 name: radiacode2mqtt
-version: "0.1.1"
+version: "0.2.0"
 slug: radiacode2mqtt
 description: Publish Radiacode readings to MQTT
 url: https://github.com/haberda/radiacode2mqtt
@@ -10,23 +10,16 @@ arch:
 startup: services
 boot: auto
 
-# Use Supervisor-supported USB access (works with Protection mode)
+# USB device access and host BlueZ over D-Bus.
 usb: true
-
-# Optional but generally harmless; can be removed later if usb:true alone works
-devices:
-  - /dev/bus/usb
-
-# Keep these to preserve BLE operation potential
-host_network: true
 host_dbus: true
-
-privileged:
-  - NET_ADMIN
-  - NET_RAW
 
 options:
   radiacode_mac: ""
+  radiacode_serial: ""
+  device_id: ""
+  operation_timeout_s: 30
+  max_recoveries: 8
   ble_connect_timeout_s: 20
   ble_scan_enabled: true
   ble_scan_seconds: 5
@@ -58,6 +51,10 @@ options:
 
 schema:
   radiacode_mac: str?
+  radiacode_serial: str?
+  device_id: str?
+  operation_timeout_s: int(1,120)?
+  max_recoveries: int(1,100)?
   ble_connect_timeout_s: int(5,120)?
   ble_scan_enabled: bool?
   ble_scan_seconds: int(1,30)?
