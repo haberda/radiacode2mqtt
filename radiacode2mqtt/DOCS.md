@@ -119,3 +119,60 @@ rate/dose, selected output units, device display units and firmware version.
 Build with `podman build -t radiacode2mqtt radiacode2mqtt` (or Docker).
 Run `python -m unittest discover -s tests -v` with the pinned runtime dependencies
 installed. The tests simulate faults and do not connect to hardware.
+
+## Spectrum camera (0.3.0)
+
+With MQTT discovery and spectra enabled, a **Radiacode Spectrum** camera appears
+on the same Home Assistant device as the sensors. Add that camera to a Picture
+Entity card on your dashboard. Use the entity selector to find its actual ID;
+Home Assistant may adjust the generated name if there is a conflict.
+
+```yaml
+spectrum:
+  enabled: true
+  interval_s: 120
+  retain: false
+  image_enabled: true
+  image_scale: log
+```
+
+`image_enabled` defaults to true; set it false to disable rendering and remove
+the camera discovery entry. `image_scale` is `log` (default) or `linear`.
+Plots show counts per channel against calibrated energy in keV. Invalid or
+non-increasing calibration falls back to channel numbers. Zero bins are masked
+on log plots; empty spectra show a waiting message. The PNG includes acquisition
+duration and a UTC capture timestamp so an older frame is identifiable.
+
+The image is a 1200×600 PNG sent as **raw binary bytes**, not JSON or Base64, on
+`<topic_prefix>/<device_id>/spectrum/image`. The latest image is always retained
+by the broker, independently of `spectrum.retain`, which controls the numeric
+JSON spectrum. This lets the camera receive the latest frame when Home Assistant
+restarts. The camera requires both bridge and instrument availability; its last
+frame may predate reconnection until the next spectrum update.
+
+No HTTP server, exposed port, or ingress configuration is needed. Image updates
+use the existing spectrum interval. Plot failures are logged without interrupting
+measurement polling or JSON spectrum publication. Disabling images or spectra
+with discovery enabled removes this camera's retained configuration and image.
+
+Matplotlib adds approximately 132 MB to the amd64 container (about 272 MB total).
+It is imported only when rendering is enabled, and each figure is released after
+encoding. Turning images off saves runtime rendering work, but does not remove
+the installed plotting libraries.
+
+For manual configuration when discovery is disabled:
+
+```yaml
+mqtt:
+  camera:
+    - name: Radiacode Spectrum
+      topic: radiacode/radiacode_usb/spectrum/image
+      encoding: ""
+      availability:
+        - topic: radiacode/radiacode_usb/availability
+        - topic: radiacode/radiacode_usb/device_availability
+      availability_mode: all
+```
+
+Replace the topic prefix and device ID to match your configuration. See the
+[Home Assistant MQTT camera documentation](https://www.home-assistant.io/integrations/camera.mqtt/).

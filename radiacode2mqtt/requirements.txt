@@ -5,3 +5,15 @@ bleak==3.0.2
 pyusb==1.3.1
 dbus-fast==5.0.22
 typing_extensions==4.16.0
+# Headless spectrum plotting.
+matplotlib==3.10.8
+numpy==2.4.6
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.64.0
+kiwisolver==1.5.1
+packaging==26.3
+pillow==12.3.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+six==1.17.0

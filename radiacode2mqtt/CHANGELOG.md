@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Add an automatically discovered MQTT spectrum camera with retained PNG frames.
+- Plot calibrated energy and counts with configurable logarithmic or linear scale.
+- Include capture time and acquisition duration; handle empty spectra and invalid calibration.
+- Keep rendering failures separate from instrument recovery and numeric telemetry.
+- Add headless plotting dependencies and spectrum camera regression tests.
+
 ## 0.2.0
 
 - Correct Sv dose conversion (100× lower than 0.1.x); preserve raw R-based values and document evidence.

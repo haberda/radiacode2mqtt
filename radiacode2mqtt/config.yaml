@@ -1,5 +1,5 @@
 name: radiacode2mqtt
-version: "0.2.0"
+version: "0.3.0"
 slug: radiacode2mqtt
 description: Publish Radiacode readings to MQTT
 url: https://github.com/haberda/radiacode2mqtt
@@ -39,6 +39,8 @@ options:
     enabled: true
     interval_s: 120
     retain: false
+    image_enabled: true
+    image_scale: log
 
   mqtt:
     host: core-mosquitto
@@ -74,6 +76,8 @@ schema:
     enabled: bool
     interval_s: int(5,86400)
     retain: bool
+    image_enabled: bool?
+    image_scale: list(linear|log)?
 
   mqtt:
     host: str

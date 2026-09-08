@@ -14,6 +14,14 @@ Leave `radiacode_mac` empty for USB, or set it for Bluetooth. New installations
 should set `device_id` to a stable serial-based identifier. Existing installations
 can leave it empty to preserve their Home Assistant entity IDs.
 
+## Spectrum camera
+
+Version 0.3.0 adds a **Radiacode Spectrum** camera through MQTT discovery. Add it
+to a Picture Entity dashboard card to display the latest energy spectrum. It
+updates at `spectrum.interval_s` (120 seconds by default). Set
+`spectrum.image_scale` to `linear` or `log`, or disable it with
+`spectrum.image_enabled: false`.
+
 ## Version 0.2.0 upgrade
 
 Dose output in Sv is corrected to 1/100 of the previous value. Review existing

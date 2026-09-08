@@ -169,7 +169,7 @@ class MqttBridge:
     def publish(self, suffix, payload, *, retain=False, qos=0):
         if not self.connected.is_set():
             return None  # Do not replay stale measurements after a broker outage.
-        if not isinstance(payload, str):
+        if not isinstance(payload, (str, bytes, bytearray)):
             payload = json_dumps(payload)
         info = self.client.publish(f"{self.base}/{suffix}", payload, qos=qos, retain=retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -270,6 +270,24 @@ def publish_discovery(client: mqtt.Client, cfg: MqttConfig, opts: dict[str, Any]
     pub_sensor("device_status", "Radiacode Device Status", "{{ value_json.device_status }}")
     pub_sensor("mqtt_connected", "Radiacode MQTT Connected", "{{ value_json.mqtt_connected }}")
 
+    spectrum = opts.get("spectrum") or {}
+    camera_topic = f"{cfg.discovery_prefix}/camera/{device_id}/spectrum/config"
+    if spectrum.get("enabled", False) and spectrum.get("image_enabled", True):
+        camera = {
+            "name": "Radiacode Spectrum",
+            "unique_id": f"{device_id}_spectrum_camera",
+            "topic": f"{base}/spectrum/image",
+            "encoding": "",
+            "availability": [{"topic": avail_topic}, {"topic": f"{base}/device_availability"}],
+            "availability_mode": "all",
+            "device": device_block,
+        }
+        client.publish(camera_topic, json_dumps(camera), qos=1, retain=True)
+    else:
+        # Remove only this add-on's camera when its feature is switched off.
+        client.publish(camera_topic, "", qos=1, retain=True)
+        client.publish(f"{base}/spectrum/image", b"", qos=1, retain=True)
+
     log.info("Published MQTT Discovery entities (device_id=%s)", device_id)
 
 
@@ -297,6 +315,8 @@ def validate_options(opts):
                          ("max_recoveries", 8)):
         if float(opts.get(key, default)) <= 0:
             raise ValueError(f"{key} must be positive")
+    if (opts.get("spectrum") or {}).get("image_scale", "log") not in {"linear", "log"}:
+        raise ValueError("spectrum.image_scale must be linear or log")
     compute_device_id_from_opts(opts)
     cfg = parse_mqtt_cfg(opts)
     if not cfg.host or not 1 <= cfg.port <= 65535:
@@ -527,8 +547,17 @@ def run(opts, stop, log, bridge=None, worker_factory=DeviceWorker):
                 if spectrum.get("enabled", False) and now >= next_spectrum:
                     try:
                         spec = worker.request("spectrum")
-                        bridge.publish("spectrum", measurements.spectrum(spec, int(time.time())),
+                        timestamp = int(time.time())
+                        bridge.publish("spectrum", measurements.spectrum(spec, timestamp),
                                        retain=bool(spectrum.get("retain", False)))
+                        if spectrum.get("image_enabled", True):
+                            try:
+                                from spectrum_plot import render_spectrum
+                                png = render_spectrum(spec, timestamp, scale=spectrum.get("image_scale", "log"))
+                                bridge.publish("spectrum/image", png, retain=True)
+                            except Exception:
+                                # Plotting must not interrupt device polling or raw spectrum publication.
+                                log.exception("Spectrum image rendering failed")
                     except (TimeoutError, ConnectionError, EOFError, OSError):
                         raise  # Transport faults require a new worker.
                     next_spectrum = time.monotonic() + max(5, int(spectrum.get("interval_s", 120)))

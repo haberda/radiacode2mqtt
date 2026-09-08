@@ -214,7 +214,7 @@ class DiscoveryTests(unittest.TestCase):
         cfg = app.MqttConfig('broker', 1883, None, None, 'radiacode', 'homeassistant', True)
         app.publish_discovery(client, cfg, {}, 'device', logging.getLogger())
         payloads = {call.args[0].split('/')[-2]: json.loads(call.args[1])
-                    for call in client.publish.call_args_list}
+                    for call in client.publish.call_args_list if "/sensor/" in call.args[0]}
         self.assertEqual(len(payloads['dose_rate']['availability']), 2)
         self.assertEqual(len(payloads['device_status']['availability']), 1)
         self.assertEqual(payloads['dose_rate']['state_class'], 'measurement')
