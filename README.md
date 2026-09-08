@@ -31,7 +31,7 @@ This add-on is intended as a lightweight “publisher-only” bridge:
 
 ## Quick start
 
-1. Install the add-on from your repository (or add it via your add-on store source).
+1. In Home Assistant, open **Settings → Apps → App store** (called **Add-ons → Add-on store** in older versions), open the menu → **Repositories**, and add `https://github.com/haberda/radiacode2mqtt`. Then install **radiacode2mqtt**.
 2. Configure MQTT broker settings.
 3. Choose connection method:
    - **USB**: leave `radiacode_mac` empty, plug device into the HA host
@@ -39,6 +39,10 @@ This add-on is intended as a lightweight “publisher-only” bridge:
 
 4. Start the add-on.
 5. If MQTT Discovery is enabled, new sensors should appear in Home Assistant automatically.
+
+The add-on supports **amd64** and **aarch64**. Home Assistant builds the image locally when installing it.
+
+The image uses Python 3.11 slim Bookworm with build tools isolated in a separate build stage. The existing BLE preflight scan still requires bluepy, even when the installed Radiacode library uses Bleak; this release does not migrate that application code.
 
 ## Configuration (high level)
 
@@ -49,7 +53,7 @@ This add-on is intended as a lightweight “publisher-only” bridge:
 - `spectrum.enabled`: publish spectrum payloads
 - `mqtt.*`: broker connection and topic settings
 
-See `docs.md` for the complete schema and examples.
+See [DOCS.md](radiacode2mqtt/DOCS.md) for the complete schema and examples.
 
 ## MQTT topics
 
@@ -75,7 +79,7 @@ If you see errors like:
 - connect attempts that never succeed / time out
 - device not found while it is clearly advertising
 
-Then review the “BLE permissions” and “Troubleshooting” sections in `docs.md`.
+Then review the “BLE permissions” and “Troubleshooting” sections in [DOCS.md](radiacode2mqtt/DOCS.md).
 
 ## Support / troubleshooting
 
@@ -85,7 +89,7 @@ Please include:
 - MQTT broker logs (if relevant)
 - Whether the Radiacode is connected to a phone at the same time (often prevents BLE connection)
 
-See `docs.md` for a checklist and common fixes.
+See [DOCS.md](radiacode2mqtt/DOCS.md) for a checklist and common fixes.
 
 ## License
 

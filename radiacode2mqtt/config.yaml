@@ -1,11 +1,11 @@
 name: radiacode2mqtt
-version: "0.1.0"
+version: "0.1.1"
 slug: radiacode2mqtt
 description: Publish Radiacode readings to MQTT
+url: https://github.com/haberda/radiacode2mqtt
 arch:
   - amd64
   - aarch64
-  - armv7
 
 startup: services
 boot: auto
